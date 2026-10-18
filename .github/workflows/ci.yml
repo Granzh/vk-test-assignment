@@ -94,6 +94,7 @@ jobs:
           cache-to: type=gha,mode=max
       - name: Production compose file is valid
         run: |
-          printf 'BOT_TOKEN=1:x\nPOSTGRES_PASSWORD=ci\n' > /tmp/ci.env
-          docker compose -f docker-compose.prod.yml --env-file /tmp/ci.env config -q
+          # both files use env_file: .env and ${...} from it, so it has to exist
+          printf 'BOT_TOKEN=1:x\nPOSTGRES_PASSWORD=ci\n' > .env
+          docker compose -f docker-compose.prod.yml config -q
           docker compose -f docker-compose.yml config -q

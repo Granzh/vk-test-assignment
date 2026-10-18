@@ -1,0 +1,124 @@
+# Production stack. See docs/deploy.md.
+#
+#   docker compose -f docker-compose.prod.yml up -d --build
+#   docker compose -f docker-compose.prod.yml --profile webhook up -d     # + HTTPS for webhook mode
+#
+# Required in .env (compose reads it for ${...} and the bot reads it as its environment):
+#   POSTGRES_PASSWORD  a long random string without characters that need URL escaping (openssl rand -hex 24)
+#   BOT_TOKEN, ADMIN_IDS, CAMPAIGN_START, CAMPAIGN_END   (see .env.example)
+#
+# What differs from the development stack: the database is not published and has
+# a real password, containers run read-only without capabilities, logs are
+# rotated, memory is limited, a nightly backup runs, and /metrics is reachable
+# from the host only (127.0.0.1).
+name: giveaway-bot
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: bot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: bot
+    command:
+      - postgres
+      - -c
+      - max_connections=100
+      - -c
+      - log_min_duration_statement=500  # slow queries (ms) go to the log
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bot -d bot"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+    stop_grace_period: 30s
+    mem_limit: 1g
+    logging: *logging
+
+  migrate:
+    build:
+      context: .
+      target: migrate
+    command: ["-dir", "/migrations", "postgres", "postgres://bot:${POSTGRES_PASSWORD}@postgres:5432/bot?sslmode=disable", "up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    logging: *logging
+
+  bot:
+    build:
+      context: .
+      target: bot
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://bot:${POSTGRES_PASSWORD}@postgres:5432/bot?sslmode=disable
+      METRICS_LISTEN: ":9090"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "127.0.0.1:9090:9090"  # /metrics, /healthz, /readyz: not exposed to the internet
+    restart: unless-stopped
+    stop_grace_period: 30s     # lets running handlers and the broadcast worker finish
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    pids_limit: 512
+    logging: *logging
+    # The HEALTHCHECK from the Dockerfile (the binary probes /readyz) applies.
+
+  backup:
+    image: postgres:16-alpine
+    environment:
+      PGHOST: postgres
+      PGUSER: bot
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: bot
+      BACKUP_DIR: /backups
+      KEEP_DAYS: ${BACKUP_KEEP_DAYS:-14}
+      BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-24}
+    volumes:
+      - ./scripts:/scripts:ro
+      - ./backups:/backups
+    entrypoint: ["/bin/sh", "/scripts/backup-loop.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    mem_limit: 256m
+    logging: *logging
+
+  # HTTPS with automatic certificates, for UPDATES_MODE=webhook only.
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["webhook"]
+    environment:
+      WEBHOOK_DOMAIN: ${WEBHOOK_DOMAIN:-localhost}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - bot
+    restart: unless-stopped
+    logging: *logging
+
+volumes:
+  caddy_data:
+  pgdata:

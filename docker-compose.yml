@@ -1,0 +1,65 @@
+# Development stack: Postgres (published on the host), migrations, the bot.
+#   cp .env.example .env   # set BOT_TOKEN, ADMIN_IDS
+#   docker compose up --build
+# For production use docker-compose.prod.yml (docs/deploy.md).
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: bot
+      POSTGRES_PASSWORD: bot
+      POSTGRES_DB: bot
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bot -d bot"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    build:
+      context: .
+      target: migrate
+    command: ["-dir", "/migrations", "postgres", "postgres://bot:bot@postgres:5432/bot?sslmode=disable", "up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  bot:
+    build:
+      context: .
+      target: bot
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://bot:bot@postgres:5432/bot?sslmode=disable
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080" # used only when UPDATES_MODE=webhook
+      - "127.0.0.1:9090:9090" # /metrics, /healthz, /readyz
+    restart: unless-stopped
+
+  # HTTPS termination with automatic certificates for webhook mode:
+  #   docker compose --profile webhook up
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["webhook"]
+    environment:
+      WEBHOOK_DOMAIN: ${WEBHOOK_DOMAIN:-localhost}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - bot
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  pgdata:
